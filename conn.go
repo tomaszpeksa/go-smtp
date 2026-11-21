@@ -39,6 +39,7 @@ type Conn struct {
 	bdatPipe        *io.PipeWriter
 	bdatStatus      *statusCollector // used for BDAT on LMTP
 	dataResult      chan error
+	bdatDone        chan struct{}
 	bytesReceived   int64 // counts total size of chunks when BDAT is used
 
 	fromReceived bool
@@ -172,7 +173,6 @@ func (c *Conn) Close() error {
 
 	if c.bdatPipe != nil {
 		c.bdatPipe.CloseWithError(ErrDataReset)
-		c.bdatPipe = nil
 	}
 
 	if c.session != nil {
@@ -1039,37 +1039,43 @@ func (c *Conn) handleBdat(arg string) {
 	}
 
 	if c.bdatPipe == nil {
+		c.locker.Lock()
 		var r *io.PipeReader
 		r, c.bdatPipe = io.Pipe()
 
 		c.dataResult = make(chan error, 1)
+		c.bdatDone = make(chan struct{})
+		done, result := c.bdatDone, c.dataResult
+		session, status, recipients := c.session, c.bdatStatus, c.recipients
+		c.locker.Unlock()
 
 		go func() {
+			defer close(done)
 			defer func() {
 				if err := recover(); err != nil {
-					c.handlePanic(err, c.bdatStatus)
+					c.handlePanic(err, status)
 
-					c.dataResult <- errPanic
+					result <- errPanic
 					r.CloseWithError(errPanic)
 				}
 			}()
 
 			var err error
 			if !c.server.LMTP {
-				err = c.Session().Data(r)
+				err = session.Data(r)
 			} else {
-				lmtpSession, ok := c.Session().(LMTPSession)
+				lmtpSession, ok := session.(LMTPSession)
 				if !ok {
-					err = c.Session().Data(r)
-					for _, rcpt := range c.recipients {
-						c.bdatStatus.SetStatus(rcpt, err)
+					err = session.Data(r)
+					for _, rcpt := range recipients {
+						status.SetStatus(rcpt, err)
 					}
 				} else {
-					err = lmtpSession.LMTPData(r, c.bdatStatus)
+					err = lmtpSession.LMTPData(r, status)
 				}
 			}
 
-			c.dataResult <- err
+			result <- err
 			r.CloseWithError(err)
 		}()
 	}
@@ -1080,7 +1086,14 @@ func (c *Conn) handleBdat(arg string) {
 	}()
 
 	chunk := io.LimitReader(c.text.R, int64(size))
-	_, err = io.Copy(c.bdatPipe, chunk)
+	n, err := io.Copy(c.bdatPipe, chunk)
+	if err == nil && n != int64(size) {
+		c.bdatPipe.CloseWithError(ErrDataReset)
+		err = <-c.dataResult
+		if err != errPanic {
+			err = io.ErrUnexpectedEOF
+		}
+	}
 	if err != nil {
 		// Backend might return an error early using CloseWithError without consuming
 		// the whole chunk.
@@ -1334,14 +1347,23 @@ func (c *Conn) readLine() (string, error) {
 	return c.text.ReadLine()
 }
 
+func (c *Conn) abortBdat() {
+	c.locker.Lock()
+	pipe, done := c.bdatPipe, c.bdatDone
+	c.locker.Unlock()
+	if pipe != nil {
+		pipe.CloseWithError(ErrDataReset)
+		<-done
+	}
+}
+
 func (c *Conn) reset() {
+	c.abortBdat()
+
 	c.locker.Lock()
 	defer c.locker.Unlock()
 
-	if c.bdatPipe != nil {
-		c.bdatPipe.CloseWithError(ErrDataReset)
-		c.bdatPipe = nil
-	}
+	c.bdatPipe = nil
 	c.bdatStatus = nil
 	c.bytesReceived = 0
 
