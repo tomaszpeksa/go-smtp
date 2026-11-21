@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/emersion/go-sasl"
@@ -27,6 +28,7 @@ type Conn struct {
 	text   *textproto.Conn
 	server *Server
 	helo   string
+	esmtp  uint32
 
 	// Number of errors witnessed on this connection
 	errCount int
@@ -197,6 +199,23 @@ func (c *Conn) Hostname() string {
 	return c.helo
 }
 
+// ESMTP reports whether the current greeting used EHLO or LHLO.
+// It is false before a greeting, after HELO, and after successful STARTTLS
+// until another greeting. RSET does not change the greeting mode.
+// The mode is available during Backend.NewSession and cleared if it fails.
+func (c *Conn) ESMTP() bool {
+	return atomic.LoadUint32(&c.esmtp) != 0
+}
+
+func (c *Conn) setGreeting(hostname string, enhanced bool) {
+	c.helo = hostname
+	var mode uint32
+	if enhanced {
+		mode = 1
+	}
+	atomic.StoreUint32(&c.esmtp, mode)
+}
+
 func (c *Conn) Conn() net.Conn {
 	return c.conn
 }
@@ -225,19 +244,20 @@ func (c *Conn) handleGreet(enhanced bool, arg string) {
 		c.writeResponse(501, EnhancedCode{5, 5, 2}, "Domain/address argument required for HELO")
 		return
 	}
-	// c.helo is populated before NewSession so
-	// NewSession can access it via Conn.Hostname.
-	c.helo = domain
-
 	// RFC 5321: "An EHLO command MAY be issued by a client later in the session"
 	if c.session != nil {
 		// RFC 5321: "... the SMTP server MUST clear all buffers
 		// and reset the state exactly as if a RSET command has been issued."
 		c.reset()
-	} else {
+	}
+
+	// c.helo is populated before NewSession so
+	// NewSession can access it via Conn.Hostname.
+	c.setGreeting(domain, enhanced)
+	if c.session == nil {
 		sess, err := c.server.Backend.NewSession(c)
 		if err != nil {
-			c.helo = ""
+			c.setGreeting("", false)
 			c.writeError(451, EnhancedCode{4, 0, 0}, err)
 			return
 		}
@@ -948,7 +968,7 @@ func (c *Conn) handleStartTLS() {
 		session.Logout()
 		c.setSession(nil)
 	}
-	c.helo = ""
+	c.setGreeting("", false)
 	c.didAuth = false
 	c.reset()
 }
