@@ -1080,7 +1080,14 @@ func (c *Conn) handleBdat(arg string) {
 	}()
 
 	chunk := io.LimitReader(c.text.R, int64(size))
-	_, err = io.Copy(c.bdatPipe, chunk)
+	n, err := io.Copy(c.bdatPipe, chunk)
+	if err == nil && n != int64(size) {
+		c.bdatPipe.CloseWithError(ErrDataReset)
+		err = <-c.dataResult
+		if err != errPanic {
+			err = io.ErrUnexpectedEOF
+		}
+	}
 	if err != nil {
 		// Backend might return an error early using CloseWithError without consuming
 		// the whole chunk.

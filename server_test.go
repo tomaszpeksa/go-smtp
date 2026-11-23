@@ -1044,6 +1044,55 @@ func TestServerBdatNoRecipientsDiscard(t *testing.T) {
 	}
 }
 
+func TestServerBdatShortChunk(t *testing.T) {
+	for _, last := range []bool{false, true} {
+		t.Run(fmt.Sprintf("last=%t", last), func(t *testing.T) {
+			be, s, c, scanner, _ := testServerEhlo(t, func(s *smtp.Server) {
+				s.Backend.(*backend).dataErrors = make(chan error, 1)
+			})
+			defer s.Close()
+			defer c.Close()
+			if err := c.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+
+			for _, command := range []string{
+				"MAIL FROM:<sender@example.com>\r\n",
+				"RCPT TO:<recipient@example.com>\r\n",
+			} {
+				io.WriteString(c, command)
+				if res := readReply(t, scanner); !strings.HasPrefix(res, "250 ") {
+					t.Fatal("Invalid envelope response:", res)
+				}
+			}
+
+			command := "BDAT 8\r\nhello"
+			if last {
+				command = "BDAT 8 LAST\r\nhello"
+			}
+			io.WriteString(c, command)
+			if err := c.(*net.TCPConn).CloseWrite(); err != nil {
+				t.Fatal(err)
+			}
+			if res := readReply(t, scanner); !strings.HasPrefix(res, "554 ") {
+				t.Fatal("Invalid short BDAT response:", res)
+			}
+
+			select {
+			case err := <-be.dataErrors:
+				if err == nil {
+					t.Fatal("Backend accepted a truncated chunk")
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("Backend did not finish reading the chunk")
+			}
+			if len(be.messages) != 0 || len(be.anonmsgs) != 0 {
+				t.Fatal("Invalid number of sent messages:", be.messages, be.anonmsgs)
+			}
+		})
+	}
+}
+
 func TestServer_Chunking(t *testing.T) {
 	be, s, c, scanner := testServerAuthenticated(t)
 	defer s.Close()
